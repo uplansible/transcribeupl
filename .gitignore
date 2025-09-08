@@ -1,0 +1,19 @@
+# Rust build directory
+/target
+# Rust backup files
+**/*.rs.bk
+# Debug files
+*.pdb
+# System files
+.DS_Store Thumbs.db
+# IDE files
+.vscode/ .idea/ *.swp *~
+# Binary files
+*.exe *.dll *.so *.dylib
+# Log files
+*.log
+# Environment files
+.env .env.local
+# AppImage build files (if you create AppImages later)
+*.AppImage
+AppDir/

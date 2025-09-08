@@ -1,0 +1,38 @@
+[package]
+name = "transcribeupl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI
+eframe = "0.23"
+egui = "0.23"
+rfd = "0.14"
+
+# Audio I/O
+rodio = { version = "0.17", default-features = false, features = ["symphonia"] }
+
+# Audio decoding
+symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "pcm"] }
+# Opus plugin via git, pinned to a stable tag compatible with symphonia 0.5.x
+symphonia-codec-opus = { git = "https://github.com/pdeljanov/Symphonia.git", package = "symphonia-codec-opus", tag = "v0.5.4" }
+
+# Input (pedal)
+evdev = "0.12"
+
+# Config + logging
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.11"
+
+# Utils
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
