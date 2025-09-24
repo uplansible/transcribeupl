@@ -1,9 +1,17 @@
+use directories::ProjectDirs;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{fs, path::PathBuf};
+
+pub const DEFAULT_VENDOR_ID: u16 = 0x0911;
+pub const DEFAULT_PRODUCT_ID: u16 = 0x1844;
+pub const DEFAULT_LEFT_CODE: u32 = 288;
+pub const DEFAULT_MIDDLE_CODE: u32 = 290;
+pub const DEFAULT_RIGHT_CODE: u32 = 289;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathsConfig {
-    pub default_open_dir: String,
+    pub default_open_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +20,12 @@ pub struct ApplicationConfig {
     pub forward_seconds: u32,
     pub hold_rewind_interval_ms: u64,
     pub play_start_rewind_seconds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputConfig {
+    pub device_path: Option<PathBuf>,
+    pub selected_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,12 +39,12 @@ pub struct PedalModel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputConfig {
-    // Path is optional and used as a fallback. Primary detection is vendor/product.
-    pub device_path: String,
-    pub selected_model: String,
-    pub pedals: Vec<PedalModel>,
-    pub pedal_defaults: PedalModel,
+pub struct PedalDefaults {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub left_code: u32,
+    pub middle_code: u32,
+    pub right_code: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,15 +52,18 @@ pub struct Config {
     pub paths: PathsConfig,
     pub application: ApplicationConfig,
     pub input: InputConfig,
+    pub pedal_defaults: PedalDefaults,
+    #[serde(default)]
+    pub pedals: Vec<PedalModel>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             paths: PathsConfig {
-                default_open_dir:
-                    "/run/user/1000/gvfs/smb-share:server=100.99.88.66,share=daten/diktat"
-                        .to_string(),
+                default_open_dir: PathBuf::from(
+                    "/run/user/1000/gvfs/smb-share:server=100.99.88.66,share=daten/diktat",
+                ),
             },
             application: ApplicationConfig {
                 rewind_seconds: 3,
@@ -55,67 +72,80 @@ impl Default for Config {
                 play_start_rewind_seconds: 1,
             },
             input: InputConfig {
-                device_path: String::new(),
-                selected_model: String::new(),
-                pedals: vec![],
-                pedal_defaults: PedalModel {
-                    name: "Default".to_string(),
-                    vendor_id: 0x0911,
-                    product_id: 0x1844,
-                    left_code: 288,
-                    middle_code: 290,
-                    right_code: 289,
-                },
+                device_path: None,
+                selected_model: None,
             },
+            pedal_defaults: PedalDefaults {
+                vendor_id: DEFAULT_VENDOR_ID,
+                product_id: DEFAULT_PRODUCT_ID,
+                left_code: DEFAULT_LEFT_CODE,
+                middle_code: DEFAULT_MIDDLE_CODE,
+                right_code: DEFAULT_RIGHT_CODE,
+            },
+            pedals: vec![],
         }
-    }
-}
-
-pub fn config_path() -> PathBuf {
-    if let Some(base) = dirs::config_dir() {
-        base.join("transcribeupl").join("config.toml")
-    } else {
-        // Fallback
-        PathBuf::from(".").join("config.toml")
     }
 }
 
 impl Config {
-    pub fn load_or_default() -> (Self, bool, PathBuf) {
-        let path = config_path();
+    pub fn config_path() -> PathBuf {
+        if let Some(pd) = ProjectDirs::from("com", "transcribeupl", "transcribeupl") {
+            let path = pd.config_dir().to_path_buf();
+            std::fs::create_dir_all(&path).ok();
+            return path.join("config.toml");
+        }
+        // Fallback to ~/.config/transcribeupl/config.toml
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = home.join(".config/transcribeupl");
+        std::fs::create_dir_all(&path).ok();
+        path.join("config.toml")
+    }
+
+    pub fn load_or_default() -> Self {
+        let path = Self::config_path();
         match fs::read_to_string(&path) {
-            Ok(s) => match toml::from_str::<Config>(&s) {
-                Ok(cfg) => (cfg, false, path),
+            Ok(s) => match toml::from_str(&s) {
+                Ok(cfg) => {
+                    info!("Loaded config from {}", path.display());
+                    cfg
+                }
                 Err(e) => {
-                    log::warn!("Failed to parse config at {}: {e}", path.display());
-                    (Self::default(), true, path)
+                    warn!(
+                        "Failed to parse config at {}: {}. Using defaults.",
+                        path.display(),
+                        e
+                    );
+                    Self::default()
                 }
             },
-            Err(_e) => {
-                log::warn!("No config found at {}. Using defaults.", path.display());
-                (Self::default(), true, path)
+            Err(_) => {
+                warn!("Config not found at {}. Using defaults.", path.display());
+                Self::default()
             }
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        let path = config_path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let s = toml::to_string_pretty(self).unwrap();
-        fs::write(path, s)
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::config_path();
+        let s = toml::to_string_pretty(self)?;
+        fs::write(&path, s)?;
+        Ok(())
     }
 
-    // Resolve the pedal detection order:
-    // 1) default vendor/product
-    // 2) additional configured pedals in their listed order
-    pub fn pedal_detection_list(&self) -> Vec<PedalModel> {
-        let mut list = Vec::new();
-        list.push(self.input.pedal_defaults.clone());
-        for p in &self.input.pedals {
-            list.push(p.clone());
+    pub fn resolve_default_open_dir(&self) -> PathBuf {
+        let p = &self.paths.default_open_dir;
+        if p.exists() && p.is_dir() {
+            return p.clone();
         }
-        list
+        // Fallbacks: HOME, CWD
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            if home.is_dir() {
+                return home;
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }

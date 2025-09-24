@@ -1,168 +1,199 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use evdev::{Device, InputEventKind};
-use std::fs;
-use std::path::PathBuf;
+use crate::config::{
+    Config, DEFAULT_LEFT_CODE, DEFAULT_MIDDLE_CODE, DEFAULT_PRODUCT_ID, DEFAULT_RIGHT_CODE,
+    DEFAULT_VENDOR_ID,
+};
+use evdev::Device;
+use log::{debug, error, info, warn};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
-
-use crate::config::{Config, PedalModel};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
-pub enum PedalScanStatus {
-    NotStarted,
+pub enum PedalStatus {
     Scanning,
-    Connected {
-        name: String,
-        path: String,
-        vendor: u16,
-        product: u16,
-    },
+    Connected { name: String, path: PathBuf },
+    NotFound,
     Error(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct PedalEvent {
-    pub code: u32,
-    pub value: i32, // 1 press, 0 release, 2 repeat (ignored)
+    pub code: u32,  // key code
+    pub value: i32, // 1=press, 0=release, 2=repeat(ignored)
+}
+
+#[derive(Debug)]
+pub enum PedalMsg {
+    Status(PedalStatus),
+    Input(PedalEvent),
+    Disconnected,
 }
 
 pub struct PedalManager {
-    status_rx: Receiver<PedalScanStatus>,
-    event_rx: Receiver<PedalEvent>,
+    tx: Sender<PedalMsg>,
+    _handle: thread::JoinHandle<()>,
 }
 
 impl PedalManager {
-    pub fn new(config: Config) -> Self {
-        let (status_tx, status_rx) = unbounded();
-        let (event_tx, event_rx) = unbounded();
-
-        // Spawn scanner thread
-        std::thread::spawn(move || scanner_loop(config, status_tx, event_tx));
-
+    pub fn start(cfg: Config, tx: Sender<PedalMsg>) -> Self {
+        let handle = thread::Builder::new()
+            .name("pedal-manager".into())
+            .spawn(move || run_manager(cfg, tx.clone()))
+            .expect("Failed to spawn pedal manager");
         Self {
-            status_rx,
-            event_rx,
+            tx,
+            _handle: handle,
         }
-    }
-
-    pub fn try_recv_status(&self) -> Option<PedalScanStatus> {
-        self.status_rx.try_recv().ok()
-    }
-
-    pub fn try_recv_events(&self) -> Vec<PedalEvent> {
-        self.event_rx.try_iter().collect()
     }
 }
 
-fn scanner_loop(config: Config, status_tx: Sender<PedalScanStatus>, event_tx: Sender<PedalEvent>) {
-    status_tx.send(PedalScanStatus::Scanning).ok();
-    let detect_list = config.pedal_detection_list();
+fn preferred_device_paths(cfg: &Config) -> Vec<Preferred> {
+    let mut v = Vec::new();
+
+    // 1) Default pedal (highest priority)
+    v.push(Preferred::VidPid {
+        vid: DEFAULT_VENDOR_ID,
+        pid: DEFAULT_PRODUCT_ID,
+    });
+
+    // 2) Configured pedals in listed order (descending by list order)
+    for p in &cfg.pedals {
+        v.push(Preferred::VidPid {
+            vid: p.vendor_id,
+            pid: p.product_id,
+        });
+    }
+
+    // 3) Fallback explicit device path if provided
+    if let Some(p) = &cfg.input.device_path {
+        v.push(Preferred::Path(p.clone()));
+    }
+
+    v
+}
+
+enum Preferred {
+    VidPid { vid: u16, pid: u16 },
+    Path(PathBuf),
+}
+
+fn run_manager(cfg: Config, tx: Sender<PedalMsg>) {
+    let mut last_report = Instant::now() - Duration::from_secs(10);
     loop {
-        match find_matching_device(&detect_list, &config.input.device_path) {
-            Ok((dev, path, _mdl)) => {
-                let name = dev.name().unwrap_or("unknown").to_string();
-                let id = dev.input_id();
-                status_tx
-                    .send(PedalScanStatus::Connected {
-                        name: name.clone(),
-                        path: path.to_string_lossy().to_string(),
-                        vendor: id.vendor(),
-                        product: id.product(),
-                    })
-                    .ok();
-                log::info!(
-                    "Pedal connected: {} @ {} (vid={:04x} pid={:04x})",
-                    name,
-                    path.display(),
-                    id.vendor(),
-                    id.product()
-                );
-                // Read loop
-                let res = read_loop(dev, &event_tx);
-                status_tx
-                    .send(PedalScanStatus::Error(format!("Pedal disconnected: {res}")))
-                    .ok();
-                log::warn!("Pedal disconnected: {}", res);
-                // fall through to rescan
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            let _ = tx.send(PedalMsg::Status(PedalStatus::Scanning));
+            last_report = Instant::now();
+        }
+
+        let prefs = preferred_device_paths(&cfg);
+
+        // Scan for a matching device
+        match find_device(&prefs) {
+            Ok(Some((path, dev))) => {
+                let name = dev.name().unwrap_or("Unknown").to_string();
+                let _ = tx.send(PedalMsg::Status(PedalStatus::Connected {
+                    name: name.clone(),
+                    path: path.clone(),
+                }));
+                info!("Pedal connected: {} @ {}", name, path.display());
+
+                // Read events until disconnect/error
+                if let Err(e) = read_events_loop(dev, &tx) {
+                    warn!("Pedal disconnected or error: {}", e);
+                }
+                let _ = tx.send(PedalMsg::Disconnected);
+                // Back to scanning
+            }
+            Ok(None) => {
+                let _ = tx.send(PedalMsg::Status(PedalStatus::NotFound));
+                thread::sleep(Duration::from_millis(2000));
             }
             Err(e) => {
-                status_tx
-                    .send(PedalScanStatus::Error(format!("Scan error: {e}")))
-                    .ok();
-                thread::sleep(Duration::from_millis(1500));
-            }
-        }
-        // Retry
-        status_tx.send(PedalScanStatus::Scanning).ok();
-        thread::sleep(Duration::from_millis(1000));
-    }
-}
-
-// Prefer vendor/product detection; fallback to explicit device_path if set.
-fn find_matching_device(
-    list: &[PedalModel],
-    device_path: &str,
-) -> Result<(Device, PathBuf, PedalModel), String> {
-    // 1) vendor/product (default first, then others by list order)
-    let mut event_paths: Vec<PathBuf> = fs::read_dir("/dev/input")
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with("event"))
-                .unwrap_or(false)
-        })
-        .collect();
-    event_paths.sort();
-
-    for mdl in list {
-        for p in &event_paths {
-            if let Ok(dev) = Device::open(p) {
-                let id = dev.input_id();
-                if id.vendor() == mdl.vendor_id && id.product() == mdl.product_id {
-                    return Ok((dev, p.clone(), mdl.clone()));
-                }
+                let _ = tx.send(PedalMsg::Status(PedalStatus::Error(e.to_string())));
+                thread::sleep(Duration::from_millis(2000));
             }
         }
     }
-
-    // 2) fallback to explicit path if provided
-    if !device_path.is_empty() {
-        let p = PathBuf::from(device_path);
-        let dev = Device::open(&p).map_err(|e| e.to_string())?;
-        let id = dev.input_id();
-        let fallback = list.first().cloned().unwrap_or_else(|| PedalModel {
-            name: "Fallback".to_string(),
-            vendor_id: id.vendor(),
-            product_id: id.product(),
-            left_code: 288,
-            middle_code: 290,
-            right_code: 289,
-        });
-        return Ok((dev, p, fallback));
-    }
-
-    Err("No matching pedal found".into())
 }
 
-fn read_loop(mut dev: Device, tx: &Sender<PedalEvent>) -> String {
-    loop {
-        match dev.fetch_events() {
-            Ok(events) => {
-                for ev in events {
-                    if let InputEventKind::Key(k) = ev.kind() {
-                        let code = k.code() as u32;
-                        let value = ev.value();
-                        // value: 1=press, 0=release, 2=repeat (ignore)
-                        if value == 0 || value == 1 {
-                            let _ = tx.send(PedalEvent { code, value });
+fn find_device(prefs: &[Preferred]) -> anyhow::Result<Option<(PathBuf, Device)>> {
+    // Snapshot of /dev/input event devices
+    let devices: Vec<(PathBuf, Device)> = match evdev::enumerate() {
+        Ok(iter) => iter.collect(),
+        Err(e) => return Err(e.into()),
+    };
+
+    for pref in prefs {
+        match pref {
+            Preferred::VidPid { vid, pid } => {
+                for (path, dev) in devices.iter() {
+                    if let Some(id) = dev.input_id() {
+                        if id.vendor == *vid && id.product == *pid {
+                            // Try opening a fresh handle to the device
+                            match Device::open(path) {
+                                Ok(devc) => return Ok(Some((path.clone(), devc))),
+                                Err(e) => {
+                                    debug!("Failed to open {}: {}", path.display(), e);
+                                }
+                            }
                         }
                     }
                 }
             }
-            Err(e) => return e.to_string(),
+            Preferred::Path(p) => {
+                if Path::new(p).exists() {
+                    match Device::open(p) {
+                        Ok(devc) => return Ok(Some((p.clone(), devc))),
+                        Err(e) => {
+                            debug!("Failed to open {}: {}", p.display(), e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_events_loop(mut dev: Device, tx: &Sender<PedalMsg>) -> anyhow::Result<()> {
+    dev.set_non_blocking(true).ok();
+    loop {
+        match dev.fetch_events() {
+            Ok(mut events) => {
+                for ev in events.drain(..) {
+                    use evdev::{InputEventKind, Key};
+                    match ev.kind() {
+                        InputEventKind::Key(Key::Unknown(code)) => {
+                            let code_u32 = code as u32;
+                            let v = ev.value();
+                            // We forward all key events; UI will map/debounce
+                            let _ = tx.send(PedalMsg::Input(PedalEvent {
+                                code: code_u32,
+                                value: v,
+                            }));
+                        }
+                        InputEventKind::Key(k) => {
+                            let code_u16 = k.code();
+                            let v = ev.value();
+                            let _ = tx.send(PedalMsg::Input(PedalEvent {
+                                code: code_u16 as u32,
+                                value: v,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No events, sleep a bit
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                // device likely disconnected
+                return Err(e.into());
+            }
         }
     }
 }
