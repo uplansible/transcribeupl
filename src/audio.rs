@@ -3,13 +3,14 @@ use log::{error, info};
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fs::File, io::BufReader, path::Path};
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer, Signal};
-use symphonia::core::codecs::DecoderOptions;
+use std::{fs::File, path::Path};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, Track};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
 // Ensure the Opus plugin is linked and self-registers.
@@ -28,9 +29,10 @@ pub fn decode_to_f32_interleaved(path: &Path) -> Result<DecodedAudio> {
     let f = File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(f), Default::default());
 
+    let hint = Hint::new();
     let probed = get_probe()
         .format(
-            &Default::default(),
+            &hint,
             mss,
             &FormatOptions::default(),
             &MetadataOptions::default(),
@@ -42,10 +44,10 @@ pub fn decode_to_f32_interleaved(path: &Path) -> Result<DecodedAudio> {
     // choose best track
     let track = select_best_track(format.tracks())
         .ok_or_else(|| anyhow!("No supported audio track found"))?;
-    let codec_params = &track.codec_params;
+    let codec_params = track.codec_params.clone(); // Clone to avoid borrow issues
 
     let mut decoder = get_codecs()
-        .make(codec_params, &DecoderOptions::default())
+        .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("Decoder creation failed: {e}"))?;
 
     let sample_rate = codec_params
@@ -77,7 +79,7 @@ pub fn decode_to_f32_interleaved(path: &Path) -> Result<DecodedAudio> {
             Err(SymphoniaError::ResetRequired) => {
                 // A new decoder instance is required.
                 decoder = get_codecs()
-                    .make(codec_params, &DecoderOptions::default())
+                    .make(&codec_params, &DecoderOptions::default())
                     .map_err(|e| anyhow!("Decoder reset failed: {e}"))?;
                 continue;
             }
@@ -97,15 +99,12 @@ pub fn decode_to_f32_interleaved(path: &Path) -> Result<DecodedAudio> {
             Err(e) => return Err(anyhow!("Decode error: {e}")),
         };
 
-        let spec = decoded.spec();
-        if spec.channels.count() != ch_count {
-            return Err(anyhow!("Variable channel count not supported"));
-        }
+        let spec = *decoded.spec();
 
         // Ensure we have a SampleBuffer large enough for this packet.
         if sample_buf
             .as_ref()
-            .map(|b| b.capacity() < decoded.capacity() || b.spec() != spec)
+            .map(|b| b.capacity() < decoded.capacity())
             .unwrap_or(true)
         {
             sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
@@ -134,8 +133,10 @@ pub fn decode_to_f32_interleaved(path: &Path) -> Result<DecodedAudio> {
 }
 
 fn select_best_track(tracks: &[Track]) -> Option<&Track> {
-    // Pick the first track with a known codec parameters.
-    tracks.iter().find(|t| t.codec_params.codec.is_some())
+    // Pick the first track with a known codec type (not NULL).
+    tracks
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
 }
 
 pub struct Output {
@@ -186,7 +187,7 @@ impl Iterator for SliceSource {
         if self.pos >= self.end {
             return None;
         }
-        let v = unsafe { *self.data.get_unchecked(self.pos) };
+        let v = self.data[self.pos];
         self.pos += 1;
         Some(v)
     }
@@ -397,12 +398,12 @@ impl Player {
     }
 
     pub fn clamp_at_end_if_needed(&mut self) {
-        if let Some(a) = &self.audio {
+        if let Some(total) = self.audio.as_ref().map(|a| a.total_samples) {
             let idx = self.current_index_interleaved();
-            if idx >= a.total_samples {
+            if idx >= total {
                 // Stop playback at end
                 self.pause();
-                self.content_index = a.total_samples;
+                self.content_index = total;
             }
         }
     }

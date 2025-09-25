@@ -12,12 +12,10 @@ use chrono::{Datelike, Local};
 use eframe::egui;
 use egui::Color32;
 use log::{error, info, warn};
-use parking_lot::Mutex;
 use rfd::FileDialog;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -311,14 +309,15 @@ impl App {
         ui.separator();
 
         // Status and Errors
-        ui.label(match &self.pedal_status {
-            PedalStatus::Scanning => "Pedal: Scanning",
+        let pedal_text = match &self.pedal_status {
+            PedalStatus::Scanning => "Pedal: Scanning".to_owned(),
             PedalStatus::Connected { name, path } => {
-                &format!("Pedal: Connected ({}, {})", name, path.display())
+                format!("Pedal: Connected ({}, {})", name, path.display())
             }
-            PedalStatus::NotFound => "Pedal: Not found",
-            PedalStatus::Error(e) => &format!("Pedal: Error ({})", e),
-        });
+            PedalStatus::NotFound => "Pedal: Not found".to_owned(),
+            PedalStatus::Error(e) => format!("Pedal: Error ({})", e),
+        };
+        ui.label(pedal_text);
 
         ui.separator();
 
@@ -415,7 +414,7 @@ impl App {
         }
     }
 
-    fn do_archive(&mut self, exit_after: bool) -> anyhow::Result<()> {
+    fn do_archive(&mut self, _exit_after: bool) -> anyhow::Result<()> {
         // Move/copy file, then unload
         let Some(src) = self.player.file_path.clone() else {
             return Err(anyhow::anyhow!("No file selected"));
@@ -516,7 +515,7 @@ fn main() -> eframe::Result<()> {
     let cfg = Config::load_or_default();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 300.0]),
+        initial_window_size: Some(egui::vec2(900.0, 300.0)),
         ..Default::default()
     };
 
